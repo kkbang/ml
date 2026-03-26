@@ -1,0 +1,27 @@
+# 환경
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# 모델/인덱스
+*.pt
+*.index
+faiss.index
+*.so
+
+# 데이터 출력물
+output.pt
+output.json
+positive_pairs.jsonl
+sample_pairs.jsonl
+sample_data.json
+
+# 환경변수
+.env
+
+# tree-sitter 언어 파일 (빌드로 생성)
+preprocessing/parser/tree-sitter-*/
+
+# HuggingFace 캐시
+.cache/
