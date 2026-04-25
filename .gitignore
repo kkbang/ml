@@ -16,6 +16,9 @@ output.json
 positive_pairs.jsonl
 sample_pairs.jsonl
 sample_data.json
+*.json
+*.jsonl
+*.txt
 
 # 환경변수
 .env
