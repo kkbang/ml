@@ -1,0 +1,9 @@
+*.pt
+*.onnx
+*.trt
+data/
+hard_negatives_gcb.jsonl
+__pycache__/
+*.pyc
+_tmp_*.jsonl
+*.so
