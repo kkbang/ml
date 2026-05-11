@@ -49,9 +49,9 @@ TRT_PATH            = 'graphcodebert_encoder.trt'
 MODEL_NAME          = 'microsoft/graphcodebert-base'
 MODEL_PATH          = 'GCB_dfg_stage2.pt'
 MAX_BATCH           = 64
-BATCH_WAIT_MS       = 20
-BATCH_MAX_SIZE      = 16        # sweet spot: ~1278 QPS
-NUM_PREPROC_WORKERS = 8
+BATCH_WAIT_MS       = 5         # 단건 요청 latency 최소화
+BATCH_MAX_SIZE      = 8         # TRT sweet spot (1293 QPS)
+NUM_PREPROC_WORKERS = 32        # CPU 64코어 중 절반 사용
 L                   = TOTAL_LENGTH
 D                   = 768
 DEVICE              = 'cuda'
@@ -221,14 +221,12 @@ async def batcher_loop():
         sorted_items   = [item for _, item in indexed]
         original_order = [i    for i, _    in indexed]
 
-        # Step 1: CPU 병렬 DFG 전처리
-        t_pre = time.perf_counter()
+        # Step 1: CPU 병렬 DFG 전처리 (asyncio.gather로 각 샘플 독립 제출)
+        t_pre   = time.perf_counter()
         args    = [(item.code, item.language, tokenizer) for item in sorted_items]
-        results = await loop.run_in_executor(
-            executor,
-            lambda: list(executor.map(preprocess_single, args))
-        )
-        ms_pre = (time.perf_counter() - t_pre) * 1000
+        futures = [loop.run_in_executor(executor, preprocess_single, arg) for arg in args]
+        results = await asyncio.gather(*futures)
+        ms_pre  = (time.perf_counter() - t_pre) * 1000
 
         ids_np   = np.array([r[0] for r in results], dtype=np.int64)
         pos_np   = np.array([r[1] for r in results], dtype=np.int64)
