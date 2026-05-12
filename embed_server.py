@@ -1,10 +1,14 @@
 """
-embed_server.py — 500 QPS 목표 GraphCodeBERT 임베딩 서버 (Split 구조)
+embed_server.py — GraphCodeBERT 임베딩 서버 (ProcessPoolExecutor 적용)
+
+핵심 변경: ThreadPoolExecutor → ProcessPoolExecutor
+  - 각 Worker 프로세스가 독립 GIL 보유 → DFG 파싱 진짜 병렬화
+  - Worker 시작 시 tokenizer 한 번만 초기화 (오버헤드 최소화)
 
 아키텍처:
-  요청 → asyncio.Queue → Batcher(20ms or 16개)
-       → ThreadPoolExecutor(DFG 전처리 병렬)
-       → GPU: dfg_replace (PyTorch, word_embeddings)
+  요청 → asyncio.Queue → Batcher(5ms or 8개)
+       → ProcessPoolExecutor (각 프로세스가 독립 GIL로 DFG 파싱)
+       → GPU: dfg_replace (PyTorch)
        → TRT: RoBERTa Transformer
        → 응답
 
@@ -22,7 +26,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from contextlib import asynccontextmanager
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ProcessPoolExecutor   # ← ThreadPool → ProcessPool
 from typing import List, Union
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -36,7 +40,7 @@ sys.path.append('/home/ngseokim/code-killr/parser')
 from dataset import encode_with_dfg, build_attn_mask, TOTAL_LENGTH
 from model import GraphCodeBERTEncoder
 
-# ── 로깅 설정 ──────────────────────────────────────────────────────────
+# ── 로깅 ──────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -47,11 +51,12 @@ logger = logging.getLogger("embed_server")
 # ── 설정 ──────────────────────────────────────────────────────────────
 TRT_PATH            = 'graphcodebert_encoder.trt'
 MODEL_NAME          = 'microsoft/graphcodebert-base'
-MODEL_PATH          = 'GCB_dfg_stage2.pt'
-MAX_BATCH           = 64
-BATCH_WAIT_MS       = 5         # 단건 요청 latency 최소화
-BATCH_MAX_SIZE      = 8         # TRT sweet spot (1293 QPS)
-NUM_PREPROC_WORKERS = 32        # CPU 64코어 중 절반 사용
+MODEL_PATH          = 'model/GCB_dfg_stage2.pt'
+MAX_BATCH           = 64     # TRT 엔진 빌드 시 설정값 (고정)
+TRT_CHUNK_SIZE      = 64     # MAX_BATCH 초과 시 TRT를 이 크기로 나눠서 호출
+BATCH_WAIT_MS       = 5     # 5 → 20ms: 더 많은 요청을 한 라운드에 묶기
+BATCH_MAX_SIZE      = 8     # 8 → 16:  한 라운드 최대 PendingRequest 수
+NUM_PREPROC_WORKERS = 32
 L                   = TOTAL_LENGTH
 D                   = 768
 DEVICE              = 'cuda'
@@ -59,23 +64,70 @@ DEVICE              = 'cuda'
 app_state: dict = {}
 
 
-# ── TRT 추론 엔진 ──────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# ProcessPoolExecutor Worker 초기화
+# ════════════════════════════════════════════════════════════════════
+
+# 각 Worker 프로세스의 전역 tokenizer
+# → 프로세스 시작 시 딱 한 번만 로드, 이후 모든 요청에서 재사용
+_worker_tokenizer = None
+
+def _init_worker(model_name: str) -> None:
+    """
+    Worker 프로세스 초기화 함수.
+    ProcessPoolExecutor가 각 Worker 프로세스를 띄울 때 딱 한 번 실행됨.
+
+    왜 필요한가:
+    - ProcessPoolExecutor는 프로세스 간 데이터를 pickle로 전달
+    - 50MB짜리 tokenizer를 매 요청마다 pickle → 전달하면 수백ms 오버헤드
+    - 대신 프로세스 시작 시 한 번만 로드해서 전역 변수로 보관
+    """
+    global _worker_tokenizer
+    # sys.path도 각 프로세스에서 별도로 설정해야 함
+    sys.path.append('/home/ngseokim/code-killr/parser')
+    _worker_tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+
+def _preprocess_single_worker(args: tuple) -> tuple:
+    """
+    Worker 프로세스에서 실행되는 DFG 전처리 함수.
+
+    핵심 최적화: mask(320×320=100KB)를 반환하지 않고
+    d2c, d2d 좌표(~2.5KB)만 반환 → pickle 직렬화 40배 감소
+    mask는 메인 프로세스에서 빠르게 생성
+    """
+    global _worker_tokenizer
+    code, language = args
+
+    try:
+        ids, pos, d2c, d2d = encode_with_dfg(code, language, _worker_tokenizer)
+        return ids, pos, d2c, d2d, True   # mask 제외 — 메인에서 생성
+    except Exception:
+        pad_id = _worker_tokenizer.pad_token_id
+        return [pad_id] * L, [1] * L, [], [], False
+
+
+# ════════════════════════════════════════════════════════════════════
+# TRT 추론 엔진
+# ════════════════════════════════════════════════════════════════════
+
 class TRTInferencer:
     """inputs_embeds (B,L,768) → cls_output (B,768)"""
 
     def __init__(self, trt_path: str):
-        logger  = trt.Logger(trt.Logger.WARNING)
-        runtime = trt.Runtime(logger)
+        logger_trt = trt.Logger(trt.Logger.WARNING)
+        runtime    = trt.Runtime(logger_trt)
         with open(trt_path, 'rb') as f:
             self.engine  = runtime.deserialize_cuda_engine(f.read())
         self.context = self.engine.create_execution_context()
         self.stream  = cuda.Stream()
 
+        # GPU 버퍼 사전 할당 (MAX_BATCH 기준으로 한 번만)
         self.d_embeds = cuda.mem_alloc(MAX_BATCH * L * D * np.dtype(np.float32).itemsize)
         self.d_attn   = cuda.mem_alloc(MAX_BATCH * L * np.dtype(np.int64).itemsize)
         self.d_pos    = cuda.mem_alloc(MAX_BATCH * L * np.dtype(np.int64).itemsize)
         self.d_out    = cuda.mem_alloc(MAX_BATCH * D * np.dtype(np.float32).itemsize)
-        print(f"  TRT 엔진 로드 완료: {trt_path}")
+        logger.info(f"TRT 엔진 로드 완료: {trt_path}")
 
     def infer(self,
               inputs_embeds:  np.ndarray,   # (B, L, D) float32
@@ -112,27 +164,22 @@ class TRTInferencer:
             pass
 
 
-# ── DFG 전처리 (CPU, 병렬) ────────────────────────────────────────────
-def preprocess_single(args) -> tuple:
-    code, language, tokenizer = args
-    try:
-        ids, pos, d2c, d2d = encode_with_dfg(code, language, tokenizer)
-        mask = build_attn_mask(pos, d2c, d2d)
-        return ids, pos, mask, True
-    except Exception:
-        pad_id = tokenizer.pad_token_id
-        return [pad_id]*L, [1]*L, np.zeros((L,L), dtype=bool), False
+# ════════════════════════════════════════════════════════════════════
+# DFG 노드 교체 (GPU, PyTorch — 메인 프로세스에서 실행)
+# ════════════════════════════════════════════════════════════════════
 
-
-# ── DFG 노드 교체 (GPU, PyTorch) ──────────────────────────────────────
 def dfg_replace_gpu(
-    input_ids:    torch.Tensor,   # (B, L)
-    position_idx: torch.Tensor,   # (B, L)
-    attn_mask:    torch.Tensor,   # (B, L, L)
+    input_ids:    torch.Tensor,
+    position_idx: torch.Tensor,
+    attn_mask:    torch.Tensor,
     word_embeddings,
     pad_token_id: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Returns numpy arrays ready for TRT"""
+    """
+    DFG 노드 임베딩 교체.
+    CPU 파싱 결과를 받아 GPU에서 avg_embeddings 계산.
+    메인 프로세스에서만 실행 (GPU는 메인 프로세스가 독점).
+    """
     with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.float32):
         nodes_mask    = position_idx.eq(0)
         token_mask    = position_idx.ge(2)
@@ -160,7 +207,10 @@ def dfg_replace_gpu(
     )
 
 
-# ── 스키마 ────────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# 요청/응답 스키마
+# ════════════════════════════════════════════════════════════════════
+
 class CodeItem(BaseModel):
     code:     str
     language: str = 'python'
@@ -173,29 +223,44 @@ class EmbedResponse(BaseModel):
     failed_indices: List[int]
     elapsed_ms:     float
 
-
 class PendingRequest:
     def __init__(self, items):
         self.items  = items
         self.future = asyncio.get_event_loop().create_future()
 
 
-# ── Batcher 루프 ──────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# Batcher 루프
+# ════════════════════════════════════════════════════════════════════
+
 async def batcher_loop():
-    queue          = app_state['queue']
-    inferencer     = app_state['inferencer']
-    executor       = app_state['executor']
-    tokenizer      = app_state['tokenizer']
+    """
+    asyncio 이벤트 루프에서 돌아가는 배치 처리기.
+
+    흐름:
+    1. Queue에서 요청 수집 (BATCH_WAIT_MS 또는 BATCH_MAX_SIZE 도달 시)
+    2. 각 코드 샘플을 ProcessPoolExecutor worker에 독립적으로 제출
+       → asyncio.gather로 모든 worker 완료 대기
+       → 각 worker는 독립 프로세스에서 진짜 병렬로 DFG 파싱
+    3. GPU에서 DFG 노드 교체
+    4. TRT 추론
+    5. 결과를 각 요청 future에 분배
+    """
+    queue           = app_state['queue']
+    inferencer      = app_state['inferencer']
+    executor        = app_state['executor']
     word_embeddings = app_state['word_embeddings']
-    pad_token_id   = app_state['pad_token_id']
-    loop           = asyncio.get_event_loop()
+    pad_token_id    = app_state['pad_token_id']
+    loop            = asyncio.get_event_loop()
 
     while True:
+        # 첫 요청 대기
         try:
             first = await asyncio.wait_for(queue.get(), timeout=1.0)
         except asyncio.TimeoutError:
             continue
 
+        # BATCH_WAIT_MS 동안 추가 요청 수집
         pending  = [first]
         deadline = time.perf_counter() + BATCH_WAIT_MS / 1000
 
@@ -209,7 +274,7 @@ async def batcher_loop():
             except asyncio.TimeoutError:
                 break
 
-        # flatten + 길이순 정렬
+        # 모든 PendingRequest의 아이템 flatten
         all_items, req_offsets = [], []
         offset = 0
         for req in pending:
@@ -217,23 +282,33 @@ async def batcher_loop():
             all_items.extend(req.items)
             offset += len(req.items)
 
+        # 길이순 정렬 (Dynamic Batching: padding 낭비 최소화)
         indexed        = sorted(enumerate(all_items), key=lambda x: len(x[1].code))
         sorted_items   = [item for _, item in indexed]
         original_order = [i    for i, _    in indexed]
 
-        # Step 1: CPU 병렬 DFG 전처리 (asyncio.gather로 각 샘플 독립 제출)
-        t_pre   = time.perf_counter()
-        args    = [(item.code, item.language, tokenizer) for item in sorted_items]
-        futures = [loop.run_in_executor(executor, preprocess_single, arg) for arg in args]
+        # ── Step 1: ProcessPoolExecutor로 DFG 파싱 (진짜 병렬) ──────
+        t_pre = time.perf_counter()
+
+        args    = [(item.code, item.language) for item in sorted_items]
+        futures = [
+            loop.run_in_executor(executor, _preprocess_single_worker, arg)
+            for arg in args
+        ]
         results = await asyncio.gather(*futures)
+
+        # mask는 메인 프로세스에서 생성 (100KB×N → 2.5KB×N pickle 절감)
+        ids_np  = np.array([r[0] for r in results], dtype=np.int64)
+        pos_np  = np.array([r[1] for r in results], dtype=np.int64)
+        mask_np = np.array(
+            [build_attn_mask(r[1], r[2], r[3]) for r in results],
+            dtype=bool
+        )
+        valid   = [r[4] for r in results]
+
         ms_pre  = (time.perf_counter() - t_pre) * 1000
 
-        ids_np   = np.array([r[0] for r in results], dtype=np.int64)
-        pos_np   = np.array([r[1] for r in results], dtype=np.int64)
-        mask_np  = np.array([r[2] for r in results], dtype=bool)
-        valid    = [r[3] for r in results]
-
-        # Step 2: GPU DFG 노드 교체 (PyTorch, word_embeddings)
+        # ── Step 2: GPU DFG 노드 교체 ────────────────────────────────
         t_dfg  = time.perf_counter()
         ids_t  = torch.tensor(ids_np,  dtype=torch.long).to(DEVICE)
         pos_t  = torch.tensor(pos_np,  dtype=torch.long).to(DEVICE)
@@ -244,10 +319,25 @@ async def batcher_loop():
         )
         ms_dfg = (time.perf_counter() - t_dfg) * 1000
 
-        # Step 3: TRT 추론
-        t_trt       = time.perf_counter()
-        embs_sorted = inferencer.infer(embeds_np, attn_np, posids_np)
-        ms_trt      = (time.perf_counter() - t_trt) * 1000
+        # ── Step 3: TRT 추론 (MAX_BATCH 초과 시 청크 분할) ─────────
+        t_trt = time.perf_counter()
+        N = len(all_items)
+        if N <= TRT_CHUNK_SIZE:
+            # 일반 케이스: 한 번에 처리
+            embs_sorted = inferencer.infer(embeds_np, attn_np, posids_np)
+        else:
+            # MAX_BATCH 초과 시: TRT_CHUNK_SIZE(64)씩 나눠서 처리 후 합치기
+            chunks = []
+            for c_start in range(0, N, TRT_CHUNK_SIZE):
+                c_end = min(c_start + TRT_CHUNK_SIZE, N)
+                chunk = inferencer.infer(
+                    embeds_np[c_start:c_end],
+                    attn_np[c_start:c_end],
+                    posids_np[c_start:c_end],
+                )
+                chunks.append(chunk)
+            embs_sorted = np.vstack(chunks)
+        ms_trt = (time.perf_counter() - t_trt) * 1000
 
         ms_total = ms_pre + ms_dfg + ms_trt
         logger.info(
@@ -258,7 +348,7 @@ async def batcher_loop():
             f"총={ms_total:.1f}ms"
         )
 
-        # 원래 순서 복원
+        # 원래 순서 복원 후 각 요청에 결과 분배
         embs = np.zeros_like(embs_sorted)
         embs[original_order] = embs_sorted
         failed_global = [original_order[i] for i, v in enumerate(valid) if not v]
@@ -268,14 +358,17 @@ async def batcher_loop():
             req.future.set_result((embs[start:end].tolist(), req_failed))
 
 
-# ── lifespan ──────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# 서버 lifespan
+# ════════════════════════════════════════════════════════════════════
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("서버 초기화 중...")
+    logger.info("서버 초기화 중...")
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
-    # 학습된 모델에서 word_embeddings 로드
-    base_encoder    = AutoModel.from_pretrained(MODEL_NAME)
+    # 학습된 모델에서 word_embeddings만 로드 (TRT 추론에 필요)
+    base_encoder    = AutoModel.from_pretrained(MODEL_NAME, attn_implementation="eager")
     model           = GraphCodeBERTEncoder(base_encoder)
     ckpt            = torch.load(MODEL_PATH, map_location=DEVICE)
     model.load_state_dict(ckpt.get('model', ckpt))
@@ -285,8 +378,19 @@ async def lifespan(app: FastAPI):
     pad_token_id    = model.encoder.config.pad_token_id
 
     inferencer = TRTInferencer(TRT_PATH)
-    executor   = ThreadPoolExecutor(max_workers=NUM_PREPROC_WORKERS)
-    queue      = asyncio.Queue(maxsize=1000)
+
+    # ── ProcessPoolExecutor 초기화 ────────────────────────────────
+    # initializer: 각 worker 프로세스 시작 시 _init_worker(MODEL_NAME) 실행
+    # → 32개 프로세스 각각이 tokenizer를 독립적으로 로드
+    # → 이후 요청 시 tokenizer 전달 오버헤드 없음
+    executor = ProcessPoolExecutor(
+        max_workers=NUM_PREPROC_WORKERS,
+        initializer=_init_worker,         # worker 시작 시 실행할 함수
+        initargs=(MODEL_NAME,),            # initializer에 전달할 인자
+    )
+    logger.info(f"ProcessPoolExecutor 초기화 완료 ({NUM_PREPROC_WORKERS} workers)")
+
+    queue = asyncio.Queue(maxsize=1000)
 
     app_state.update({
         'tokenizer':       tokenizer,
@@ -298,8 +402,10 @@ async def lifespan(app: FastAPI):
     })
 
     batcher_task = asyncio.create_task(batcher_loop())
-    print(f"준비 완료 | TRT={TRT_PATH} | preproc_workers={NUM_PREPROC_WORKERS}")
+    logger.info(f"서버 준비 완료 | TRT={TRT_PATH} | workers={NUM_PREPROC_WORKERS}")
     yield
+
+    # 종료 시 정리
     batcher_task.cancel()
     executor.shutdown(wait=False)
     app_state.clear()
@@ -308,7 +414,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title='code-killr embedding API', lifespan=lifespan)
 
 
-# ── 엔드포인트 ────────────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════
+# 엔드포인트
+# ════════════════════════════════════════════════════════════════════
+
 @app.post('/embed', response_model=EmbedResponse)
 async def embed(request: EmbedRequest):
     if not request.items:
@@ -335,12 +444,13 @@ async def health():
     return {
         'status': 'ok', 'trt_engine': TRT_PATH,
         'max_batch': MAX_BATCH, 'preproc_workers': NUM_PREPROC_WORKERS,
+        'executor_type': 'ProcessPoolExecutor',
     }
 
 
 # ── OpenAI 호환 엔드포인트 (/v1/embeddings) ───────────────────────────
 class OpenAIEmbedRequest(BaseModel):
-    input: List[Union[CodeItem, str]]   # str이면 language="python" 기본값
+    input: List[Union[CodeItem, str]]
     model: str = "code-killr"
 
 class OpenAIEmbeddingData(BaseModel):
@@ -362,7 +472,6 @@ async def openai_embed(request: OpenAIEmbedRequest):
     if len(request.input) > MAX_BATCH:
         raise HTTPException(status_code=400, detail=f'최대 {MAX_BATCH}개')
 
-    # str 입력 → CodeItem 변환 (language 기본값: python)
     items = [
         CodeItem(code=item, language='python') if isinstance(item, str) else item
         for item in request.input

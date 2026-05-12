@@ -15,7 +15,8 @@
 - **GraphCodeBERT + DFG**: Data Flow Graph를 입력으로 받아 변수명 변경에 강건한 임베딩 생성
 - **Weighted NT-Xent Loss**: GPL/LGPL 라이선스에 높은 가중치를 부여한 대조 학습
 - **2단계 학습**: Stage1 (기본 대조 학습) → Hard Negative Mining → Stage2 (강화 학습)
-- **1,293 QPS 서빙**: TensorRT FP16 + 비동기 Dynamic Batching + OpenAI 호환 API
+- **Split Architecture 서빙**: DFG 전처리(ProcessPoolExecutor) + Transformer(TensorRT FP16)
+- **OpenAI 호환 API**: `/v1/embeddings` 엔드포인트 제공
 
 ---
 
@@ -48,15 +49,16 @@
 | 75% | 0.6140 |
 | 100% | 0.1660 |
 
-### 서빙 성능 (RTX 3090, TensorRT FP16)
+### 서빙 성능 (RTX 3090, TensorRT FP16 + ProcessPoolExecutor)
 
-| batch | latency | QPS |
-|---|---|---|
-| 1 | 1.9ms | 528 |
-| 8 | 6.2ms | **1,293** |
-| 16 | 12.9ms | 1,244 |
-| 32 | 26.7ms | 1,198 |
-| 64 | 53.0ms | 1,208 |
+| 동시 요청 수 | Throughput | p50 Latency | p99 Latency |
+|---|---|---|---|
+| 1 | ~80 items/sec | ~64ms | - |
+| 8 | 322 items/sec | 195ms | 220ms |
+| 16 | **365 items/sec** | 328ms | 415ms |
+| 32 | 349 items/sec | 663ms | 969ms |
+
+> 실제 프로덕션 코드(복잡한 함수) 기준: 단건 요청 ~100~200ms
 
 ---
 
@@ -84,17 +86,30 @@ Weighted NT-Xent Loss
 클라이언트 요청
       ↓
 asyncio.Queue
-      ↓ BATCH_WAIT_MS(5ms) or BATCH_MAX_SIZE(8개) 대기
+      ↓ BATCH_WAIT_MS(5ms) or BATCH_MAX_SIZE(8개) 도달 시
    Batcher
-      ↓ CPU 병렬 DFG 파싱 (ThreadPoolExecutor × 8)  ~2ms
-      ↓ GPU DFG 노드 임베딩 교체 (PyTorch)           ~6ms
-      ↓ TensorRT FP16 Transformer 추론               ~3ms
+      ↓ ProcessPoolExecutor(32 workers) — 각 프로세스 독립 GIL
+        DFG 파싱 (encode_with_dfg) 진짜 병렬 실행       ~15~60ms
+      ↓ 메인 프로세스: build_attn_mask + GPU DFG 교체     ~20ms
+      ↓ TensorRT FP16 Transformer 추론 (batch=8)          ~10ms
       ↓ L2 정규화 → 결과 분배
-   응답 (총 ~11ms)
+   응답
 ```
 
-> **Split Architecture 이유**: GraphCodeBERT의 커스텀 DFG forward는 TRT export 시 호환 문제가 있어,  
-> DFG 전처리(Python/PyTorch)와 Transformer(TRT)를 분리하여 각각 최적화합니다.
+> **Split Architecture 이유**: GraphCodeBERT의 커스텀 DFG forward는 ONNX/TRT export 시
+> Transformers 버전 호환 문제가 있어, DFG 전처리(Python/PyTorch)와
+> Transformer(TRT)를 분리하여 각각 최적화합니다.
+
+### 최적화 적용 내역
+
+| 순위 | 기법 | 적용 여부 | 효과 |
+|---|---|---|---|
+| 1 | TensorRT FP16 | ✅ | GPU 추론 1,293 QPS (batch=8) |
+| 2 | ProcessPoolExecutor | ✅ | DFG 파싱 진짜 병렬화 (GIL 우회) |
+| 3 | Dynamic Batching | ✅ | 길이순 정렬로 padding 최소화 |
+| 4 | Thread Affinity | ✅ | KMP_AFFINITY 환경변수 |
+| 5 | Pickle 최적화 | ✅ | mask 직렬화 제거 (12.8MB → 320KB) |
+| 6 | CUDA Streams | ❌ | 파이프라인 구조 변경 필요 |
 
 ### 모델 스펙
 
@@ -124,102 +139,70 @@ code-killr/
 ├── train_stage2_gcb.py             # Stage2 학습 (Hard Negative 혼합)
 │
 ├── evaluate.py                     # 성능 평가 (레벨별/언어별/라이선스별/강건성)
+├── benchmark.py                    # 서버 Latency/Throughput/QPS 측정
 │
-├── export_onnx.py                  # RoBERTa encoder → ONNX 변환 (Split)
+├── export_onnx.py                  # RoBERTa encoder → ONNX (Split 구조)
 ├── convert_trt.py                  # ONNX → TensorRT FP16 변환
 ├── embed_server.py                 # FastAPI 임베딩 서버 (OpenAI 호환)
 │
 ├── data/
-│   ├── train_v3.jsonl              # 학습 데이터 (positive pair)
-│   ├── val_v3.jsonl                # 검증 데이터
-│   ├── test_v3.jsonl               # 테스트 데이터
-│   └── opensearch_data_100k.json   # Hard Negative Mining 풀 (98,006개)
+│   ├── train_v3.jsonl
+│   ├── val_v3.jsonl
+│   ├── test_v3.jsonl
+│   └── opensearch_data_100k.json
 │
 ├── hard_negatives_gcb.jsonl        # Mining 결과 (10,253개, avg sim: 0.6925)
 ├── GCB_dfg_stage1.pt               # Stage1 체크포인트 (val loss: 0.0179)
 ├── GCB_dfg_stage2.pt               # Stage2 체크포인트 (val loss: 0.0078)
 ├── graphcodebert_encoder.onnx      # ONNX 모델 (RoBERTa encoder)
-└── graphcodebert_encoder.trt       # TensorRT FP16 엔진
+└── graphcodebert_encoder.trt       # TensorRT FP16 엔진 (MAX_BATCH=64)
 ```
 
 ---
 
-## 데이터 형식
-
-### train/val/test (JSONL)
-```json
-{
-  "anchor":   "def foo(x): return x + 1",
-  "positive": "def bar(y): return y + 1",
-  "language": "python",
-  "license":  "GPL-3.0",
-  "level":    "surface",
-  "repo":     "https://github.com/..."
-}
-```
-
-### hard_negatives_gcb (JSONL)
-```json
-{
-  "anchor":           "...",
-  "negative":         "...",
-  "similarity":       0.6832,
-  "anchor_license":   "GPL-3.0",
-  "negative_license": "MIT",
-  "language":         "java"
-}
-```
-
----
-
-## 실행 방법
-
-### 환경 설정
+## 환경 설정
 
 ```bash
-# 학습 환경
+# 학습 환경 (Transformers 5.x)
 conda create -n code-killr python=3.12 -y
 conda activate code-killr
-pip install torch transformers==5.8.0 tree-sitter==0.20.4 fastapi uvicorn
+pip install torch transformers tree-sitter==0.20.4 fastapi uvicorn
 
-# 서빙 환경 (TRT 호환)
+# 서빙 환경 (Transformers 4.40.0 — TRT export 호환)
 conda create -n code-killr-serve python=3.12 -y
 conda activate code-killr-serve
-pip install torch transformers==4.40.0 fastapi uvicorn onnx onnxruntime tensorrt pycuda tree-sitter==0.20.4
+pip install torch transformers==4.40.0 fastapi uvicorn \
+            onnx onnxruntime tensorrt pycuda \
+            tree-sitter==0.20.4 aiohttp numpy
 ```
 
-### Stage1 학습
+---
+
+## 학습 파이프라인
 
 ```bash
+# Stage1
 python train_graphcodebert.py
-# best val loss: 0.0179 (epoch 6, early stop at epoch 11)
-```
+# → best val loss: 0.0179 (epoch 6, early stop epoch 11)
 
-### Hard Negative Mining
-
-```bash
+# Hard Negative Mining
 python hard_negative_mining_gcb.py
-# 결과: 10,253개 저장, 평균 유사도 0.6925
-```
+# → 10,253개 저장, 평균 유사도 0.6925
 
-### Stage2 학습
-
-```bash
+# Stage2
 python train_stage2_gcb.py
-# best val loss: 0.0078
-```
+# → best val loss: 0.0078
 
-### 성능 평가
-
-```bash
+# 성능 평가
 python evaluate.py
 ```
 
-### 서빙 파이프라인
+---
+
+## 서빙 파이프라인
 
 ```bash
-# Step 1: ONNX export (서빙 환경에서)
-conda activate code-killr-serve
+# Step 1: ONNX export (서빙 환경 conda activate code-killr-serve)
 python export_onnx.py
 
 # Step 2: TensorRT 변환 (~40초 소요)
@@ -231,6 +214,9 @@ export MKL_NUM_THREADS=8
 export KMP_AFFINITY=granularity=fine,compact,1,0
 uvicorn embed_server:app --host 0.0.0.0 --port 8000 --workers 1
 ```
+
+> 서버 시작 시 ProcessPoolExecutor 32개 프로세스가 초기화됩니다 (30~60초 소요).  
+> `서버 준비 완료` 로그 확인 후 사용하세요.
 
 ---
 
@@ -258,27 +244,7 @@ response = client.embeddings.create(
     ]
 )
 
-vectors = [d.embedding for d in response.data]  # List[List[float]], shape: (N, 768)
-```
-
-### curl
-
-```bash
-# 문자열 입력
-curl -X POST http://<서버IP>:8000/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -d '{"model": "code-killr", "input": ["def add(x, y): return x + y"]}'
-
-# 언어 명시
-curl -X POST http://<서버IP>:8000/v1/embeddings \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "code-killr",
-    "input": [
-      {"code": "def add(x, y): return x + y", "language": "python"},
-      {"code": "public int add(int a, int b) {}", "language": "java"}
-    ]
-  }'
+vectors = [d.embedding for d in response.data]  # (N, 768)
 ```
 
 ### 응답 형식
@@ -309,22 +275,31 @@ for i in range(0, len(docs), BATCH_SIZE):
         ]
     )
     embeddings = [d.embedding for d in response.data]
-    # OpenSearch에 저장
 ```
 
 ### 제약사항
 
 - 한 번에 최대 64개
 - 지원 언어: `python`, `java`, `javascript`, `go`, `ruby`, `php`
-- 언어 미지정 시 `python` 기본값 적용
+- 언어 미지정 시 `python` 기본값
 
 ---
 
-## 서버 로그 예시
+## 벤치마크
+
+```bash
+# 기본
+python benchmark.py
+
+# 파라미터 조정
+python benchmark.py --concurrency 16 --batch-size 8 --total 400 --url http://localhost:8000
+```
+
+### 서버 로그 예시
 
 ```
-03:50:39 [INFO] batch= 1 | DFG전처리=2.1ms | DFG교체=5.7ms | TRT=3.3ms | 총=11.2ms
-03:50:39 [INFO] /v1/embeddings | items=1 | 31.87ms
+16:23:11 [INFO] batch= 8 | DFG전처리=18.3ms | DFG교체=4.2ms | TRT=6.1ms | 총=28.6ms
+16:23:11 [INFO] /v1/embeddings | items=8 | 34.2ms
 ```
 
 ---
@@ -333,7 +308,7 @@ for i in range(0, len(docs), BATCH_SIZE):
 
 | 라이선스 | 가중치 | 이유 |
 |---|---|---|
-| GPL-2.0 / GPL-3.0 / AGPL-3.0 | 3.0 | 강한 카피레프트, 위반 시 법적 영향 큼 |
+| GPL-2.0 / GPL-3.0 / AGPL-3.0 | 3.0 | 강한 카피레프트 |
 | LGPL-2.1 / LGPL-3.0 | 2.0 | 약한 카피레프트 |
 | MIT / Apache-2.0 / 기타 | 1.0 | 허용적 라이선스 |
 
@@ -344,6 +319,7 @@ for i in range(0, len(docs), BATCH_SIZE):
 | 항목 | 사양 |
 |---|---|
 | GPU | NVIDIA RTX 3090 (24GB, Ampere CC 8.6) |
+| CPU | 64코어 |
 | OS | Ubuntu (Remote SSH) |
 | 학습 환경 | conda `code-killr`, Python 3.12, Transformers 5.8.0 |
 | 서빙 환경 | conda `code-killr-serve`, Python 3.12, Transformers 4.40.0 |
