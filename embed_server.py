@@ -83,10 +83,10 @@ def _init_worker(model_name: str) -> None:
 def _encode_with_dfg_rust(code: str, language: str, tokenizer) -> tuple:
     rs_tokens, rs_dfg = _extract_rust(code, language)
     dfg = list(rs_dfg)
-    code_tokens_sub = [
-        tokenizer.tokenize('@ ' + x)[1:] if idx != 0 else tokenizer.tokenize(x)
-        for idx, x in enumerate(rs_tokens)
-    ]
+    # 배치 tokenize (개별 호출 N번 → 1번으로 단축)
+    prefixed        = [rs_tokens[0]] + ['@ ' + x for x in rs_tokens[1:]]
+    batch_ids       = tokenizer(prefixed, add_special_tokens=False)['input_ids']
+    code_tokens_sub = [tokenizer.convert_ids_to_tokens(batch_ids[0])] +                       [tokenizer.convert_ids_to_tokens(ids)[1:] for ids in batch_ids[1:]]
     ori2cur_pos = {-1: (0, 0)}
     for i in range(len(code_tokens_sub)):
         ori2cur_pos[i] = (ori2cur_pos[i-1][1], ori2cur_pos[i-1][1] + len(code_tokens_sub[i]))
