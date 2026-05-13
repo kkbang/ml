@@ -19,6 +19,7 @@ embed_server.py — GraphCodeBERT 임베딩 서버 (ProcessPoolExecutor 적용)
 """
 
 import sys
+sys.path.insert(0, '/home/ngseokim/code-killr/core')
 import asyncio
 import time
 import logging

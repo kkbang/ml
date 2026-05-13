@@ -12,6 +12,7 @@ GraphCodeBERT 성능 평가
 import os
 import re
 import sys
+sys.path.insert(0, '/home/ngseokim/code-killr/core')
 import json
 import random
 import numpy as np

@@ -4,6 +4,7 @@ convert_trt.py — ONNX(inputs_embeds 입력) → TensorRT 변환
 """
 
 import sys
+sys.path.insert(0, '/home/ngseokim/code-killr/core')
 import time
 import numpy as np
 import tensorrt as trt

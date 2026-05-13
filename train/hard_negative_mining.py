@@ -6,6 +6,7 @@ import torch.nn.functional as F
 from transformers import AutoModel, AutoTokenizer
 from collections import Counter
 import sys
+sys.path.insert(0, '/home/ngseokim/code-killr/core')
 
 sys.path.append('/home/ngseokim/code-killr/parser')
 from dataset import encode_with_dfg, build_attn_mask, TOTAL_LENGTH

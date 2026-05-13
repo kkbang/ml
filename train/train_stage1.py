@@ -7,6 +7,7 @@ from dataset import PairDataset
 from loss import weighted_nt_xent_loss
 from tqdm import tqdm
 import sys
+sys.path.insert(0, '/home/ngseokim/code-killr/core')
 
 sys.path.append('/home/ngseokim/code-killr/parser')
 

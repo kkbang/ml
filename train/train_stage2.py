@@ -19,6 +19,7 @@ from loss import weighted_nt_xent_loss
 from model import GraphCodeBERTEncoder
 from tqdm import tqdm
 import sys
+sys.path.insert(0, '/home/ngseokim/code-killr/core')
 
 sys.path.append('/home/ngseokim/code-killr/parser')
 from dataset import PairDataset, encode_with_dfg, build_attn_mask, TOTAL_LENGTH

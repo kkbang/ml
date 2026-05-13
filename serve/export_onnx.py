@@ -6,6 +6,7 @@ DFG 노드 교체는 Python에서 처리, Transformer 12레이어만 TRT로 가�
 """
 
 import sys
+sys.path.insert(0, '/home/ngseokim/code-killr/core')
 import torch
 import torch.nn as nn
 import numpy as np

@@ -3,6 +3,7 @@ validate_dfg.py â€” Python extract_dataflow() vs Rust extract_dataflow_rust() ë¹
 """
 
 import sys
+sys.path.insert(0, '/home/ngseokim/code-killr/core')
 import time
 from transformers import AutoTokenizer
 
