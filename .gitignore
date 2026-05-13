@@ -11,3 +11,8 @@ parser/tree-sitter-*
 graphcodebert.onnx.data
 *.onnx
 *.trt
+*.onnx
+*.trt
+*.txt
+benchmark_result.json
+graphcodebert.onnx.data
