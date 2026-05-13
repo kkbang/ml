@@ -71,37 +71,51 @@ app_state: dict = {}
 # 각 Worker 프로세스의 전역 tokenizer
 # → 프로세스 시작 시 딱 한 번만 로드, 이후 모든 요청에서 재사용
 _worker_tokenizer = None
+_extract_rust      = None
 
 def _init_worker(model_name: str) -> None:
-    """
-    Worker 프로세스 초기화 함수.
-    ProcessPoolExecutor가 각 Worker 프로세스를 띄울 때 딱 한 번 실행됨.
-
-    왜 필요한가:
-    - ProcessPoolExecutor는 프로세스 간 데이터를 pickle로 전달
-    - 50MB짜리 tokenizer를 매 요청마다 pickle → 전달하면 수백ms 오버헤드
-    - 대신 프로세스 시작 시 한 번만 로드해서 전역 변수로 보관
-    """
-    global _worker_tokenizer
-    # sys.path도 각 프로세스에서 별도로 설정해야 함
+    global _worker_tokenizer, _extract_rust
     sys.path.append('/home/ngseokim/code-killr/parser')
     _worker_tokenizer = AutoTokenizer.from_pretrained(model_name)
+    from dfg_rs import extract_dataflow_rust
+    _extract_rust = extract_dataflow_rust
 
+def _encode_with_dfg_rust(code: str, language: str, tokenizer) -> tuple:
+    rs_tokens, rs_dfg = _extract_rust(code, language)
+    dfg = list(rs_dfg)
+    code_tokens_sub = [
+        tokenizer.tokenize('@ ' + x)[1:] if idx != 0 else tokenizer.tokenize(x)
+        for idx, x in enumerate(rs_tokens)
+    ]
+    ori2cur_pos = {-1: (0, 0)}
+    for i in range(len(code_tokens_sub)):
+        ori2cur_pos[i] = (ori2cur_pos[i-1][1], ori2cur_pos[i-1][1] + len(code_tokens_sub[i]))
+    code_tokens_flat = [t for sub in code_tokens_sub for t in sub]
+    max_code = TOTAL_LENGTH - 3 - min(len(dfg), 64)
+    code_tokens_flat = code_tokens_flat[:max_code][:512-3]
+    source_tokens = [tokenizer.cls_token] + code_tokens_flat + [tokenizer.sep_token]
+    source_ids    = tokenizer.convert_tokens_to_ids(source_tokens)
+    position_idx  = [i + tokenizer.pad_token_id + 1 for i in range(len(source_tokens))]
+    dfg = dfg[:TOTAL_LENGTH - len(source_tokens)]
+    source_tokens += [x[0] for x in dfg]
+    position_idx  += [0] * len(dfg)
+    source_ids    += [tokenizer.unk_token_id] * len(dfg)
+    pad_len        = TOTAL_LENGTH - len(source_ids)
+    position_idx  += [tokenizer.pad_token_id] * pad_len
+    source_ids    += [tokenizer.pad_token_id] * pad_len
+    reverse_index  = {x[1]: i for i, x in enumerate(dfg)}
+    for i, (name, idx, sources) in enumerate(dfg):
+        dfg[i] = (name, idx, [reverse_index[j] for j in sources if j in reverse_index])
+    dfg_to_code = [(ori2cur_pos[x[1]][0] + 1, ori2cur_pos[x[1]][1] + 1) for x in dfg]
+    dfg_to_dfg  = [x[2] for x in dfg]
+    return source_ids, position_idx, dfg_to_code, dfg_to_dfg
 
 def _preprocess_single_worker(args: tuple) -> tuple:
-    """
-    Worker 프로세스에서 실행되는 DFG 전처리 함수.
-
-    핵심 최적화: mask(320×320=100KB)를 반환하지 않고
-    d2c, d2d 좌표(~2.5KB)만 반환 → pickle 직렬화 40배 감소
-    mask는 메인 프로세스에서 빠르게 생성
-    """
     global _worker_tokenizer
     code, language = args
-
     try:
-        ids, pos, d2c, d2d = encode_with_dfg(code, language, _worker_tokenizer)
-        return ids, pos, d2c, d2d, True   # mask 제외 — 메인에서 생성
+        ids, pos, d2c, d2d = _encode_with_dfg_rust(code, language, _worker_tokenizer)
+        return ids, pos, d2c, d2d, True
     except Exception:
         pad_id = _worker_tokenizer.pad_token_id
         return [pad_id] * L, [1] * L, [], [], False

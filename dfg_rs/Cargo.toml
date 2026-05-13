@@ -1,0 +1,19 @@
+[package]
+name = "dfg_rs"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "dfg_rs"
+crate-type = ["cdylib"]   # Python 확장 모듈로 빌드
+
+[dependencies]
+libloading = "0.8"
+pyo3       = { version = "0.20", features = ["extension-module"] }
+tree-sitter = "0.20"
+
+# 언어별 tree-sitter 파서 (GraphCodeBERT와 동일한 0.20 계열)
+
+[profile.release]
+opt-level = 3
+lto = true       # Link Time Optimization → 추가 5~15% 속도 향상
