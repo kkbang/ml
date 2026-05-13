@@ -8,3 +8,6 @@ __pycache__/
 _tmp_*.jsonl
 *.so
 parser/tree-sitter-*
+graphcodebert.onnx.data
+*.onnx
+*.trt
