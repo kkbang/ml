@@ -22,6 +22,7 @@ import sys
 sys.path.insert(0, '/home/ngseokim/code-killr/core')
 import asyncio
 import time
+import collections
 import logging
 import numpy as np
 import torch
@@ -38,6 +39,7 @@ import pycuda.driver as cuda
 import pycuda.autoinit
 
 sys.path.append('/home/ngseokim/code-killr/parser')
+sys.path.insert(0, '/home/ngseokim/code-killr/core')
 from dataset import encode_with_dfg, build_attn_mask, TOTAL_LENGTH
 from model import GraphCodeBERTEncoder
 
@@ -50,19 +52,29 @@ logging.basicConfig(
 logger = logging.getLogger("embed_server")
 
 # ── 설정 ──────────────────────────────────────────────────────────────
-TRT_PATH            = 'graphcodebert_encoder.trt'
+TRT_PATH            = '/home/ngseokim/code-killr/graphcodebert_encoder.trt'
 MODEL_NAME          = 'microsoft/graphcodebert-base'
-MODEL_PATH          = 'model/GCB_dfg_stage2.pt'
+MODEL_PATH          = '/home/ngseokim/code-killr/model/GCB_dfg_stage2.pt'
 MAX_BATCH           = 64     # TRT 엔진 빌드 시 설정값 (고정)
 TRT_CHUNK_SIZE      = 64     # MAX_BATCH 초과 시 TRT를 이 크기로 나눠서 호출
 BATCH_WAIT_MS       = 5     # 5 → 20ms: 더 많은 요청을 한 라운드에 묶기
-BATCH_MAX_SIZE      = 8     # 8 → 16:  한 라운드 최대 PendingRequest 수
+BATCH_MAX_SIZE      = 16     # 8 → 16:  한 라운드 최대 PendingRequest 수
 NUM_PREPROC_WORKERS = 32
 L                   = TOTAL_LENGTH
 D                   = 768
 DEVICE              = 'cuda'
 
 app_state: dict = {}
+
+# ── 실시간 통계 추적 ──────────────────────────────────────────────────
+_stats = {
+    'total_requests':     0,
+    'total_items':        0,
+    'total_embedding_ms': 0.0,
+    'latencies_ms':       collections.deque(maxlen=10000),
+    'start_time':         time.time(),
+}
+
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -77,6 +89,8 @@ _extract_rust      = None
 def _init_worker(model_name: str) -> None:
     global _worker_tokenizer, _extract_rust
     sys.path.append('/home/ngseokim/code-killr/parser')
+    sys.path.insert(0, '/home/ngseokim/code-killr/core')
+    sys.path.insert(0, '/home/ngseokim/code-killr/core')
     _worker_tokenizer = AutoTokenizer.from_pretrained(model_name)
     from dfg_rs import extract_dataflow_rust
     _extract_rust = extract_dataflow_rust
@@ -498,6 +512,10 @@ async def openai_embed(request: OpenAIEmbedRequest):
     embeddings, _ = await req.future
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
+    _stats['total_requests'] += 1
+    _stats['total_items']    += len(items)
+    _stats['latencies_ms'].append(elapsed_ms)
+    _stats['total_embedding_ms'] += elapsed_ms
     logger.info(f"/v1/embeddings | items={len(items)} | {elapsed_ms}ms")
     return OpenAIEmbedResponse(
         data=[
@@ -510,3 +528,39 @@ async def openai_embed(request: OpenAIEmbedRequest):
             'total_tokens':  sum(len(it.code.split()) for it in items),
         },
     )
+
+
+@app.get('/stats')
+async def stats():
+    import numpy as np
+    lats = list(_stats['latencies_ms'])
+    elapsed = time.time() - _stats['start_time']
+    if not lats:
+        return {'message': '아직 요청 없음'}
+    pure_sec = _stats['total_embedding_ms'] / 1000
+    return {
+        'uptime_seconds':        round(elapsed, 1),
+        'total_requests':        _stats['total_requests'],
+        'total_items':           _stats['total_items'],
+        'pure_embedding_seconds': round(pure_sec, 1),
+        'qps':                   round(_stats['total_requests'] / pure_sec, 2),
+        'throughput_items_sec':  round(_stats['total_items'] / pure_sec, 2),
+        'latency_ms': {
+            'p50':  round(float(np.percentile(lats, 50)), 1),
+            'p75':  round(float(np.percentile(lats, 75)), 1),
+            'p95':  round(float(np.percentile(lats, 95)), 1),
+            'p99':  round(float(np.percentile(lats, 99)), 1),
+            'avg':  round(float(np.mean(lats)), 1),
+            'max':  round(float(np.max(lats)), 1),
+            'min':  round(float(np.min(lats)), 1),
+        },
+        'last_n_samples': len(lats),
+    }
+
+@app.post('/stats/reset')
+async def stats_reset():
+    _stats['total_requests'] = 0
+    _stats['total_items']    = 0
+    _stats['latencies_ms'].clear()
+    _stats['start_time']     = time.time()
+    return {'message': '통계 초기화 완료'}
