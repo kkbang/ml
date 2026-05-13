@@ -16,3 +16,4 @@ graphcodebert.onnx.data
 *.txt
 benchmark_result.json
 graphcodebert.onnx.data
+preprocessing/
