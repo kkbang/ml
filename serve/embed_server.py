@@ -58,7 +58,7 @@ MODEL_PATH          = '/home/ngseokim/code-killr/model/GCB_dfg_stage2.pt'
 MAX_BATCH           = 64     # TRT 엔진 빌드 시 설정값 (고정)
 TRT_CHUNK_SIZE      = 64     # MAX_BATCH 초과 시 TRT를 이 크기로 나눠서 호출
 BATCH_WAIT_MS       = 5     # 5 → 20ms: 더 많은 요청을 한 라운드에 묶기
-BATCH_MAX_SIZE      = 16     # 8 → 16:  한 라운드 최대 PendingRequest 수
+BATCH_MAX_SIZE      = 128     # 8 → 16:  한 라운드 최대 PendingRequest 수
 NUM_PREPROC_WORKERS = 32
 L                   = TOTAL_LENGTH
 D                   = 768
@@ -71,8 +71,12 @@ _stats = {
     'total_requests':     0,
     'total_items':        0,
     'total_embedding_ms': 0.0,
+    'processing_ms':      0.0,
+    'queue_wait_ms':      0.0,
     'latencies_ms':       collections.deque(maxlen=10000),
     'start_time':         time.time(),
+    'first_request_time': None,
+    'last_request_time':  None,
 }
 
 
@@ -254,8 +258,9 @@ class EmbedResponse(BaseModel):
 
 class PendingRequest:
     def __init__(self, items):
-        self.items  = items
-        self.future = asyncio.get_event_loop().create_future()
+        self.items         = items
+        self.future        = asyncio.get_event_loop().create_future()
+        self._enqueue_time = time.perf_counter()
 
 
 # ════════════════════════════════════════════════════════════════════
@@ -317,6 +322,7 @@ async def batcher_loop():
         original_order = [i    for i, _    in indexed]
 
         # ── Step 1: ProcessPoolExecutor로 DFG 파싱 (진짜 병렬) ──────
+        _stats['queue_wait_ms'] += sum((time.perf_counter() - req._enqueue_time) * 1000 for req in pending)
         t_pre = time.perf_counter()
 
         args    = [(item.code, item.language) for item in sorted_items]
@@ -369,6 +375,7 @@ async def batcher_loop():
         ms_trt = (time.perf_counter() - t_trt) * 1000
 
         ms_total = ms_pre + ms_dfg + ms_trt
+        _stats['processing_ms'] += ms_total
         logger.info(
             f"batch={len(all_items):2d} | "
             f"DFG전처리={ms_pre:.1f}ms | "
@@ -512,6 +519,10 @@ async def openai_embed(request: OpenAIEmbedRequest):
     embeddings, _ = await req.future
     elapsed_ms = round((time.perf_counter() - t0) * 1000, 2)
 
+    now = time.time()
+    if _stats['first_request_time'] is None:
+        _stats['first_request_time'] = now
+    _stats['last_request_time']  = now
     _stats['total_requests'] += 1
     _stats['total_items']    += len(items)
     _stats['latencies_ms'].append(elapsed_ms)
@@ -533,18 +544,23 @@ async def openai_embed(request: OpenAIEmbedRequest):
 @app.get('/stats')
 async def stats():
     import numpy as np
-    lats = list(_stats['latencies_ms'])
+    lats    = list(_stats['latencies_ms'])
     elapsed = time.time() - _stats['start_time']
+    f       = _stats['first_request_time']
+    l       = _stats['last_request_time']
+    pure_sec = round(_stats['processing_ms'] / 1000, 1)
+
     if not lats:
         return {'message': '아직 요청 없음'}
-    pure_sec = _stats['total_embedding_ms'] / 1000
     return {
         'uptime_seconds':        round(elapsed, 1),
+        'pure_embedding_seconds': pure_sec,
+        'queue_wait_seconds':     round(_stats['queue_wait_ms'] / 1000, 1),
+        'total_server_seconds':   round((_stats['processing_ms'] + _stats['queue_wait_ms']) / 1000, 1),
         'total_requests':        _stats['total_requests'],
         'total_items':           _stats['total_items'],
-        'pure_embedding_seconds': round(pure_sec, 1),
-        'qps':                   round(_stats['total_requests'] / pure_sec, 2),
-        'throughput_items_sec':  round(_stats['total_items'] / pure_sec, 2),
+        'qps':              round(_stats['total_requests'] / pure_sec, 2) if pure_sec > 0 else 0,
+        'throughput_items_sec': round(_stats['total_items'] / pure_sec, 2) if pure_sec > 0 else 0,
         'latency_ms': {
             'p50':  round(float(np.percentile(lats, 50)), 1),
             'p75':  round(float(np.percentile(lats, 75)), 1),
@@ -559,8 +575,13 @@ async def stats():
 
 @app.post('/stats/reset')
 async def stats_reset():
-    _stats['total_requests'] = 0
-    _stats['total_items']    = 0
+    _stats['total_requests']     = 0
+    _stats['total_items']        = 0
+    _stats['total_embedding_ms'] = 0.0
+    _stats['processing_ms']      = 0.0
+    _stats['queue_wait_ms']      = 0.0
     _stats['latencies_ms'].clear()
-    _stats['start_time']     = time.time()
+    _stats['start_time']         = time.time()
+    _stats['first_request_time'] = None
+    _stats['last_request_time']  = None
     return {'message': '통계 초기화 완료'}
