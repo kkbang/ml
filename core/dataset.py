@@ -6,9 +6,9 @@ from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
 sys.path.append('/home/ngseokim/code-killr/parser')
-from parser.DFG import (DFG_python, DFG_java, DFG_javascript,
+from DFG import (DFG_python, DFG_java, DFG_javascript,
                  DFG_go, DFG_ruby, DFG_php, DFG_csharp)
-from parser.utils import (tree_to_token_index, index_to_code_token,
+from utils import (tree_to_token_index, index_to_code_token,
                    remove_comments_and_docstrings)
 from tree_sitter import Language, Parser
 
@@ -76,7 +76,7 @@ def encode_with_dfg(code: str, language: str, tokenizer):
 
     # 토큰화
     code_tokens = [
-        tokenizer.tokenize('@ ' + x)[1:] if idx != 0 else tokenizer.tokenize(x)
+        tokenizer.tokenize('@ ' + x[:64])[1:] if idx != 0 else tokenizer.tokenize(x)
         for idx, x in enumerate(code_tokens)
     ]
 

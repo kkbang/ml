@@ -54,7 +54,7 @@ logger = logging.getLogger("embed_server")
 # ── 설정 ──────────────────────────────────────────────────────────────
 TRT_PATH            = '/home/ngseokim/code-killr/graphcodebert_encoder.trt'
 MODEL_NAME          = 'microsoft/graphcodebert-base'
-MODEL_PATH          = '/home/ngseokim/code-killr/model/GCB_dfg_stage2.pt'
+MODEL_PATH          = '/home/ngseokim/code-killr/model/GCB_dfg_stage4b.pt'
 MAX_BATCH           = 64     # TRT 엔진 빌드 시 설정값 (고정)
 TRT_CHUNK_SIZE      = 64     # MAX_BATCH 초과 시 TRT를 이 크기로 나눠서 호출
 BATCH_WAIT_MS       = 5     # 5 → 20ms: 더 많은 요청을 한 라운드에 묶기

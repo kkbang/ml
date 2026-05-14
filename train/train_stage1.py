@@ -1,3 +1,16 @@
+import sys
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv(Path(__file__).resolve().parents[1] / '.env')
+
+ROOT = Path(os.getenv('PROJECT_ROOT'))
+
+sys.path.insert(0, str(ROOT / 'core'))
+sys.path.append(str(ROOT / 'parser'))
+
+
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
@@ -6,10 +19,7 @@ from model import GraphCodeBERTEncoder
 from dataset import PairDataset
 from loss import weighted_nt_xent_loss
 from tqdm import tqdm
-import sys
-sys.path.insert(0, '/home/ngseokim/code-killr/core')
 
-sys.path.append('/home/ngseokim/code-killr/parser')
 
 CONFIG = {
     'train_path':   'data/train_v3.jsonl',

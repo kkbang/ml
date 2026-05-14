@@ -20,7 +20,7 @@ from model import GraphCodeBERTEncoder
 from dataset import TOTAL_LENGTH
 
 MODEL_NAME  = 'microsoft/graphcodebert-base'
-MODEL_PATH  = 'GCB_dfg_stage2.pt'
+MODEL_PATH  = '/home/ngseokim/code-killr/model/GCB_dfg_stage4b.pt'
 ONNX_PATH   = 'graphcodebert_encoder.onnx'
 VERIFY_PATH = 'onnx_verify_result.txt'
 OPSET       = 17
