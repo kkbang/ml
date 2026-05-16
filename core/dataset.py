@@ -5,7 +5,7 @@ import torch
 from torch.utils.data import Dataset
 from transformers import AutoTokenizer
 
-sys.path.append('/home/ngseokim/code-killr/parser')
+sys.path.append('/home/shinmk/code-killr/parser')
 from DFG import (DFG_python, DFG_java, DFG_javascript,
                  DFG_go, DFG_ruby, DFG_php, DFG_csharp)
 from utils import (tree_to_token_index, index_to_code_token,
@@ -13,7 +13,7 @@ from utils import (tree_to_token_index, index_to_code_token,
 from tree_sitter import Language, Parser
 
 # ── 파서 초기화 ──────────────────────────────────────
-SO_PATH = '/home/ngseokim/code-killr/parser/my-languages.so'
+SO_PATH = '/home/shinmk/code-killr/parser/my-languages.so'
 
 PARSERS = {}
 DFG_FUNC = {

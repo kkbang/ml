@@ -17,9 +17,14 @@ embed_server.py — GraphCodeBERT 임베딩 서버 (ProcessPoolExecutor 적용)
   export KMP_AFFINITY=granularity=fine,compact,1,0
   uvicorn embed_server:app --host 0.0.0.0 --port 8000 --workers 1
 """
+import os
+from pathlib import Path
+from dotenv import load_dotenv
+
+load_dotenv()
+PROJECT_ROOT = Path(os.getenv("PROJECT_ROOT"))
 
 import sys
-sys.path.insert(0, '/home/ngseokim/code-killr/core')
 import asyncio
 import time
 import collections
@@ -38,8 +43,8 @@ import tensorrt as trt
 import pycuda.driver as cuda
 import pycuda.autoinit
 
-sys.path.append('/home/ngseokim/code-killr/parser')
-sys.path.insert(0, '/home/ngseokim/code-killr/core')
+sys.path.insert(0, f"{PROJECT_ROOT}/core")
+sys.path.insert(0, f"{PROJECT_ROOT}/parser")
 from dataset import encode_with_dfg, build_attn_mask, TOTAL_LENGTH
 from model import GraphCodeBERTEncoder
 
@@ -52,9 +57,9 @@ logging.basicConfig(
 logger = logging.getLogger("embed_server")
 
 # ── 설정 ──────────────────────────────────────────────────────────────
-TRT_PATH            = '/home/ngseokim/code-killr/graphcodebert_encoder.trt'
+TRT_PATH            = PROJECT_ROOT / "graphcodebert_encoder.trt"
 MODEL_NAME          = 'microsoft/graphcodebert-base'
-MODEL_PATH          = '/home/ngseokim/code-killr/model/GCB_dfg_stage4b.pt'
+MODEL_PATH          = PROJECT_ROOT / "model" / "GCB_dfg_stage4b.pt"
 MAX_BATCH           = 64     # TRT 엔진 빌드 시 설정값 (고정)
 TRT_CHUNK_SIZE      = 64     # MAX_BATCH 초과 시 TRT를 이 크기로 나눠서 호출
 BATCH_WAIT_MS       = 5     # 5 → 20ms: 더 많은 요청을 한 라운드에 묶기
@@ -90,11 +95,10 @@ _stats = {
 _worker_tokenizer = None
 _extract_rust      = None
 
-def _init_worker(model_name: str) -> None:
+def _init_worker(model_name: str, project_root: str) -> None:
     global _worker_tokenizer, _extract_rust
-    sys.path.append('/home/ngseokim/code-killr/parser')
-    sys.path.insert(0, '/home/ngseokim/code-killr/core')
-    sys.path.insert(0, '/home/ngseokim/code-killr/core')
+    sys.path.insert(0, f"{project_root}/parser")
+    sys.path.insert(0, f"{project_root}/core")
     _worker_tokenizer = AutoTokenizer.from_pretrained(model_name)
     from dfg_rs import extract_dataflow_rust
     _extract_rust = extract_dataflow_rust
@@ -422,7 +426,7 @@ async def lifespan(app: FastAPI):
     executor = ProcessPoolExecutor(
         max_workers=NUM_PREPROC_WORKERS,
         initializer=_init_worker,         # worker 시작 시 실행할 함수
-        initargs=(MODEL_NAME,),            # initializer에 전달할 인자
+        initargs=(MODEL_NAME, str(PROJECT_ROOT)),            # initializer에 전달할 인자
     )
     logger.info(f"ProcessPoolExecutor 초기화 완료 ({NUM_PREPROC_WORKERS} workers)")
 

@@ -10,7 +10,7 @@ use libloading::{Library, Symbol};
 use std::sync::OnceLock;
 
 static SO_LIB: OnceLock<Library> = OnceLock::new();
-const SO_PATH: &str = "/home/ngseokim/code-killr/parser/my-languages.so";
+const SO_PATH: &str = "/home/shinmk/code-killr/parser/my-languages.so";
 
 fn get_language(language: &str) -> Option<Language> {
     let lib = SO_LIB.get_or_init(|| {
