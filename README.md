@@ -150,6 +150,15 @@ Code Tokens + Data Flow Graph
 ### 신뢰도 검증 (`verify_eval_pipeline.py`)
 7가지 sanity check로 평가 자체의 신뢰성 입증.
 
+| Check | 검증 대상 | v4 결과 |
+|-------|---------|--------|
+| 1. Coverage | OS에 anchor 존재 여부 | 290/364 (≈80%) |
+| 2. Mapping | case_id ↔ file_path 무결성 | 100% |
+| 3. Surface | 정답이 candidates에 등장하는지 | TP/FN별 측정 |
+| 4. matched_by | retrieval 경로 분포 | kNN+rule 55 / rule 17 / kNN 4 |
+| 5. Risk dist | risk level 분포 정상성 | 카테고리별 직관 일치 |
+| 6. Worst patterns | 실패 케이스 공통 패턴 | Cap 설계 근거로 활용 |
+| 7. Spot check | 응답 구조 무결성 | 정상 |
 ---
 
 ## Iteration & Results
