@@ -204,18 +204,6 @@ F1 Score:        0.8957
 
 ---
 
-## Next Steps
-
-| 옵션 | 효과 | 비용 | 권장도 |
-|-----|------|-----|-------|
-| **A. v4 production 배포 + 운영 로그 수집** | 즉시 가치, 실분포 파악 | 낮음 | ★★★ |
-| B. Cross-encoder reranker 도입 | FP borderline 해결 | Latency↑ | ★★ |
-| C. 모델 재학습 (hard negative + 도메인 다양성) | FN 근본 개선 | 사이클 김 | ★★ |
-
-권장: **A 선행** → 운영 데이터로 B/C 중 ROI 높은 쪽 결정.
-
----
-
 ## API
 
 OpenAI 호환 `/v1/embeddings` 엔드포인트.
@@ -232,5 +220,17 @@ POST /retrieve/hybrid/by-repo-url
   "merged_top_k": 100
 }
 ```
+
+---
+
+## Next Steps
+
+| 옵션 | 효과 | 비용 | 권장도 |
+|-----|------|-----|-------|
+| **A. v4 production 배포 + 운영 로그 수집** | 즉시 가치, 실분포 파악 | 낮음 | ★★★ |
+| B. Cross-encoder reranker 도입 | FP borderline 해결 | Latency↑ | ★★ |
+| C. 모델 재학습 (hard negative + 도메인 다양성) | FN 근본 개선 | 사이클 김 | ★★ |
+
+권장: **A 선행** → 운영 데이터로 B/C 중 ROI 높은 쪽 결정.
 
 ---
