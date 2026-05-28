@@ -13,7 +13,7 @@
 
 - **Base model**: `microsoft/graphcodebert-base` (125M params)
 - **Embedding**: 768-dim, L2-normalized
-- **지원 언어**: Python, Java, JavaScript, Go, Ruby, PHP, C#
+- **지원 언어**: Python, Java, JavaScript, Go, Ruby, C#
 
 ---
 
