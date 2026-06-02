@@ -1,4 +1,4 @@
-# 프로젝트 이름
+# Liecense Detector
 
 > License Violation Code Plagiarism Detection System
 > 오픈소스 라이선스(GPL, LGPL, MIT 등) 코드의 무단 복제·리팩터링 탐지
